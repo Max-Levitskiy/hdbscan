@@ -5,6 +5,10 @@ from pydantic import BaseModel
 import numpy as np
 import hdbscan
 from supabase import create_client, Client
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- Env ---
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -67,28 +71,45 @@ def _parse_vector(v: Any) -> List[float]:
     Normalize pgvector into python list[float].
     Handles cases:
       - already list (ideal)
-      - '{1.0,2.0,...}' string
+      - '[1.0,2.0,...]' JSON array string
+      - '{1.0,2.0,...}' PostgreSQL array string
       - '(1.0,2.0,...)' string (rare)
     """
     if isinstance(v, list):
         return [float(x) for x in v]
     if isinstance(v, str):
         s = v.strip()
-        if s.startswith('{') and s.endswith('}'):
+        if s.startswith('[') and s.endswith(']'):
+            # JSON array format: "[1.0, 2.0, ...]"
+            try:
+                import json
+                return json.loads(s)
+            except json.JSONDecodeError:
+                # Fallback: try to parse manually
+                s = s[1:-1]  # Remove brackets
+        elif s.startswith('{') and s.endswith('}'):
+            # PostgreSQL array format: "{1.0,2.0,...}"
             s = s[1:-1]
         elif s.startswith('(') and s.endswith(')'):
+            # Tuple format: "(1.0,2.0,...)"
             s = s[1:-1]
+
         if not s:
             return []
-        return [float(x) for x in s.split(',')]
-    raise ValueError(f"Unsupported vector type: {type(v)}")
+
+        # Split by comma and convert to float
+        try:
+            return [float(x.strip()) for x in s.split(',') if x.strip()]
+        except ValueError as e:
+            raise ValueError(f"Could not parse vector string '{s}': {e}")
+
+    raise ValueError(f"Unsupported vector type: {type(v)}, value: {v}")
 
 def _select_columns(id_col: str, vec_col: str, created_at_col: str) -> str:
     """
-    We ask PostgREST to cast vector to float8[] for safer JSON (when supported).
-    If cast fails in your project, drop `::float8[]` and rely on _parse_vector.
+    Select columns without casting. Let _parse_vector handle the conversion.
     """
-    return f"{id_col},{vec_col}::{'float8[]'} as {vec_col},{created_at_col}"
+    return f"{id_col},{vec_col},{created_at_col}"
 
 def _apply_filters(q, req: ClusterRequest):
     # time window
@@ -158,20 +179,27 @@ def write_back(
     outliers: np.ndarray,
 ):
     table = supabase.table(req.table)
-    payloads = []
-    for i, _id in enumerate(ids):
-        payloads.append({
-            req.id_column: _id,
-            req.cluster_id_column: int(labels[i]),
-            req.cluster_prob_column: float(probs[i]),
-            req.outlier_score_column: float(outliers[i]),
-        })
-        if len(payloads) >= req.batch_write_size:
-            table.upsert(payloads, on_conflict=req.id_column, returning="minimal").execute()
-            payloads = []
 
-    if payloads:
-        table.upsert(payloads, on_conflict=req.id_column, returning="minimal").execute()
+    # Process in smaller batches to avoid issues
+    batch_size = min(req.batch_write_size, 50)
+
+    for i in range(0, len(ids), batch_size):
+        batch_ids = ids[i:i + batch_size]
+        batch_labels = labels[i:i + batch_size]
+        batch_probs = probs[i:i + batch_size]
+        batch_outliers = outliers[i:i + batch_size]
+
+        # Update each record individually to avoid constraint issues
+        for j, _id in enumerate(batch_ids):
+            try:
+                table.update({
+                    req.cluster_id_column: int(batch_labels[j]),
+                    req.cluster_prob_column: float(batch_probs[j]),
+                    req.outlier_score_column: float(batch_outliers[j]),
+                }).eq(req.id_column, _id).execute()
+            except Exception as e:
+                # Log the error but continue with other records
+                print(f"Failed to update record {_id}: {e}")
 
 # -------- endpoints ----------
 @app.get("/healthz")
@@ -183,16 +211,44 @@ def healthz():
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+@app.get("/debug-data")
+def debug_data(limit: int = 5):
+    """Debug endpoint to see what data is in the database"""
+    try:
+        table = supabase.table(DEFAULT_TABLE)
+        select_str = _select_columns(DEFAULT_ID_COL, DEFAULT_VECTOR_COL, DEFAULT_CREATED_AT_COL)
+        res = table.select(select_str).limit(limit).execute()
+        data = res.data or []
+
+        # Process the data to see what we get
+        processed = []
+        for row in data:
+            processed.append({
+                "id": row.get(DEFAULT_ID_COL),
+                "vector_raw": row.get(DEFAULT_VECTOR_COL),
+                "vector_parsed": _parse_vector(row.get(DEFAULT_VECTOR_COL)) if row.get(DEFAULT_VECTOR_COL) else None,
+                "created_at": row.get(DEFAULT_CREATED_AT_COL)
+            })
+
+        return {
+            "total_rows": len(data),
+            "sample_data": processed
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/cluster", response_model=ClusterResponse)
 def cluster(req: ClusterRequest):
     try:
         ids, vecs = fetch_rows(req)
         if not ids:
-            raise HTTPException(400, "No rows selected with current filters.")
+            raise HTTPException(400, f"No rows selected with current filters. Table: {req.table}, Filters: {req.where}")
 
         X = np.asarray(vecs, dtype=np.float32)
-        if X.ndim != 2 or X.shape[0] != len(ids):
-            raise HTTPException(500, "Vector shape mismatch.")
+        if X.ndim != 2:
+            raise HTTPException(500, f"Vector shape mismatch: expected 2D array, got {X.ndim}D")
+        if X.shape[0] != len(ids):
+            raise HTTPException(500, f"Vector count mismatch: {X.shape[0]} vectors but {len(ids)} ids")
 
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=req.min_cluster_size,
